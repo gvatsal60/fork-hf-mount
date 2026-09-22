@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use super::inode::ROOT_INODE;
 use super::*;
+use crate::follow::{FollowChange, FollowEvent, FollowOp};
 use crate::hub_api::HeadFileInfo;
 use crate::test_mocks::{MockHub, MockXet, TestOpts, make_overlay_test_vfs_with_root, make_test_vfs};
 
@@ -2764,6 +2765,42 @@ fn unlink_cleans_staging() {
 
 // ── poll_remote_changes ─────────────────────────────────────────────
 
+/// Run `poll_remote_changes` (10ms interval) in the background until the
+/// returned `Notify` fires.
+fn spawn_poll_loop(
+    vfs: &std::sync::Arc<VirtualFs>,
+    hub: &std::sync::Arc<MockHub>,
+    live_follow: bool,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>) {
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_clone = stop.clone();
+    let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
+    let inodes = vfs.inode_table.clone();
+    let neg = vfs.negative_cache.clone();
+    let inv = vfs.invalidator.clone();
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = VirtualFs::poll_remote_changes(
+                hub_dyn, inodes, neg, inv,
+                Some(Duration::from_millis(10)), 4, live_follow,
+            ) => {}
+            _ = stop_clone.notified() => {}
+        }
+    });
+    (stop, handle)
+}
+
+/// Poll `cond` every 10ms for up to 5s. Returns whether it became true.
+async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+    for _ in 0..500 {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
 /// poll_remote_changes calls probe_revision once per round and skips the
 /// tree-listing fan-out when the value is unchanged. When the revision
 /// advances, list_tree fires again. When the probe returns a non-401 error,
@@ -2782,21 +2819,7 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         // The lookup above triggered ensure_children_loaded -> 1 list_tree call.
         let baseline_list_tree = hub.list_tree_call_count();
 
-        let stop = Arc::new(tokio::sync::Notify::new());
-        let stop_clone = stop.clone();
-        let hub_dyn: Arc<dyn crate::hub_api::HubOps> = hub.clone();
-        let inodes = vfs.inode_table.clone();
-        let neg = vfs.negative_cache.clone();
-        let inv = vfs.invalidator.clone();
-        let handle = tokio::spawn(async move {
-            tokio::select! {
-                _ = VirtualFs::poll_remote_changes(
-                    hub_dyn, inodes, neg, inv,
-                    Duration::from_millis(10), 4,
-                ) => {}
-                _ = stop_clone.notified() => {}
-            }
-        });
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, false);
 
         // Let 5 rounds run with identical revision -> probe fires, list_tree does not.
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2811,12 +2834,10 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         let probes_before = hub.probe_revision_call_count();
         hub.set_revision("rev-b");
         // Wait until at least one more probe + one fan-out.
-        for _ in 0..50 {
-            if hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(|| {
+            hub.probe_revision_call_count() > probes_before && hub.list_tree_call_count() > baseline_list_tree
+        })
+        .await;
         assert!(
             hub.list_tree_call_count() > baseline_list_tree,
             "list_tree must fire after revision change"
@@ -2825,15 +2846,338 @@ fn poll_skips_list_tree_when_revision_unchanged() {
         // Probe error (non-401) -> fall back to full fan-out.
         let lists_before = hub.list_tree_call_count();
         hub.fail_revision(None, "simulated probe failure");
-        for _ in 0..50 {
-            if hub.list_tree_call_count() > lists_before {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(|| hub.list_tree_call_count() > lists_before).await;
         assert!(
             hub.list_tree_call_count() > lists_before,
             "list_tree must fire when probe fails (fallback)"
+        );
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
+// ── live-follow ─────────────────────────────────────────────────────
+
+fn follow_change(path: &str, op: FollowOp) -> FollowChange {
+    FollowChange {
+        path: path.to_string(),
+        op,
+        size: None,
+        xet_hash: None,
+        uploaded_at: None,
+        mtime: None,
+    }
+}
+
+/// An `add` in a loaded directory drops that directory's cached listing and
+/// clears the negative-cache entries for the path (and its ancestors), so
+/// the next lookup re-lists just the affected directory and finds the file.
+#[test]
+fn follow_add_invalidates_loaded_dir_and_negative_cache() {
+    let hub = MockHub::new();
+    hub.add_file("dir/a.txt", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Load "dir" and populate the negative cache with a miss under it.
+        let dir = vfs.lookup(ROOT_INODE, "dir").await.unwrap();
+        vfs.readdir(dir.ino).await.unwrap();
+        assert_eq!(vfs.lookup(dir.ino, "new.txt").await.unwrap_err(), libc::ENOENT);
+        assert!(vfs.negative_cache.read().unwrap().contains_key("dir/new.txt"));
+
+        // A producer commits dir/new.txt; the follow feed reports it.
+        hub.add_file("dir/new.txt", 5, Some("h2"), None);
+        let mut change = follow_change("dir/new.txt", FollowOp::Add);
+        change.size = Some(5);
+        change.xet_hash = Some("h2".to_string());
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+
+        assert!(!vfs.negative_cache.read().unwrap().contains_key("dir/new.txt"));
+        assert!(
+            !vfs.inode_table.read().unwrap().is_children_loaded(dir.ino),
+            "dir's cached listing must be dropped"
+        );
+        let attr = vfs.lookup(dir.ino, "new.txt").await.unwrap();
+        assert_eq!(attr.size, 5);
+    });
+}
+
+/// An `update` for an already-materialized clean file is applied in place;
+/// fields absent from the change keep their current value (a bare re-upload
+/// carries only `uploadedAt` and must not clear the hash, size or mtime).
+#[test]
+fn follow_update_applies_in_place_and_merges_fields() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
+
+        let mut change = follow_change("file.txt", FollowOp::Update);
+        change.size = Some(99);
+        change.xet_hash = Some("h2".to_string());
+        change.uploaded_at = Some("2026-05-01T00:00:00Z".to_string());
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        {
+            let inodes = vfs.inode_table.read().unwrap();
+            let entry = inodes.get(attr.ino).unwrap();
+            assert_eq!(entry.size, 99);
+            assert_eq!(entry.xet_hash.as_deref(), Some("h2"));
+        }
+
+        // Identical re-upload: only uploadedAt — hash and size unchanged.
+        let mut change = follow_change("file.txt", FollowOp::Update);
+        change.uploaded_at = Some("2026-05-01T00:00:01Z".to_string());
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        let mtime_after_reupload = vfs.inode_table.read().unwrap().get(attr.ino).unwrap().mtime;
+        assert_eq!(
+            mtime_after_reupload,
+            crate::hub_api::mtime_from_str("2026-05-01T00:00:01Z")
+        );
+
+        // Size-only delta: no mtime nor uploadedAt keeps the current mtime.
+        let mut change = follow_change("file.txt", FollowOp::Update);
+        change.size = Some(100);
+        VirtualFs::apply_follow_changes(&[change], &vfs.inode_table, &vfs.negative_cache, &vfs.invalidator);
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert_eq!(entry.size, 100);
+        assert_eq!(entry.xet_hash.as_deref(), Some("h2"));
+        assert_eq!(
+            entry.mtime, mtime_after_reupload,
+            "absent mtime must keep the current one"
+        );
+        // Applied in place: the parent listing is still consistent, so a hot
+        // directory isn't re-listed on every batch.
+        assert!(
+            inodes.is_children_loaded(ROOT_INODE),
+            "in-place update must keep root's listing"
+        );
+    });
+}
+
+/// A `delete` removes a clean materialized file but never a dirty one
+/// (local writes win until flushed).
+#[test]
+fn follow_delete_removes_clean_file_keeps_dirty() {
+    let hub = MockHub::new();
+    hub.add_file("a.txt", 10, Some("h1"), None);
+    hub.add_file("b.txt", 10, Some("h2"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let a = vfs.lookup(ROOT_INODE, "a.txt").await.unwrap();
+        let b = vfs.lookup(ROOT_INODE, "b.txt").await.unwrap();
+        vfs.inode_table.write().unwrap().get_mut(b.ino).unwrap().set_dirty();
+
+        VirtualFs::apply_follow_changes(
+            &[
+                follow_change("a.txt", FollowOp::Delete),
+                follow_change("b.txt", FollowOp::Delete),
+            ],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(inodes.get(a.ino).is_none(), "clean file must be removed");
+        assert!(inodes.get(b.ino).is_some(), "dirty file must be kept");
+    });
+}
+
+/// Changes under directories that were never loaded are no-ops: their first
+/// listing will be fresh anyway, and loaded ancestors above them stay valid.
+#[test]
+fn follow_change_under_unloaded_dir_is_noop() {
+    let hub = MockHub::new();
+    hub.add_file("a/b.txt", 10, Some("h1"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Root is pre-loaded at mount; "a" exists as an entry but is unloaded.
+        VirtualFs::apply_follow_changes(
+            &[follow_change("a/b.txt", FollowOp::Update)],
+            &vfs.inode_table,
+            &vfs.negative_cache,
+            &vfs.invalidator,
+        );
+        let inodes = vfs.inode_table.read().unwrap();
+        assert!(
+            inodes.is_children_loaded(ROOT_INODE),
+            "root listing untouched: the change is under 'a', not in root"
+        );
+        let a_ino = inodes.get_dir_ino("a").unwrap();
+        assert!(!inodes.is_children_loaded(a_ino), "'a' stays unloaded");
+    });
+}
+
+/// End-to-end follow-loop transitions against the scripted mock feed:
+/// changes apply while the stream is healthy (no probe/fan-out), a plain
+/// end of stream (TCP close) and a server-directed reconnect both resume
+/// with the last received cursor, and a `reset` runs one full poll round
+/// before re-subscribing from the fresh `updatedAt`.
+#[test]
+fn follow_stream_reconnects_with_cursor_and_relists_on_reset() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    hub.enable_follow();
+    // Session 1: ready → one change batch → the connection drops.
+    hub.push_follow(FollowEvent::Ready {
+        cursor: Some("c1".to_string()),
+    });
+    hub.push_follow(FollowEvent::Changes {
+        cursor: "c2".to_string(),
+        changes: vec![follow_change("new.txt", FollowOp::Add)],
+    });
+    hub.end_follow_stream();
+    // Session 2: ready → server-directed reconnect with a newer cursor.
+    hub.push_follow(FollowEvent::Ready {
+        cursor: Some("c2".to_string()),
+    });
+    hub.push_follow(FollowEvent::Reconnect {
+        cursor: Some("c5".to_string()),
+    });
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        // Root was pre-loaded at mount → loaded_dir_prefixes is non-empty.
+        let baseline_list_tree = hub.list_tree_call_count();
+        let baseline_probes = hub.probe_revision_call_count();
+
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
+
+        // Wait for session 3 (after the drop and the server-directed reconnect).
+        wait_until(|| hub.follow_connect_log().len() >= 3).await;
+        let log = hub.follow_connect_log();
+        assert!(log.len() >= 3, "expected two reconnects, got {log:?}");
+        // First connect: no cursor yet → since = last known updatedAt.
+        assert_eq!(log[0], (None, Some("rev-a".to_string())));
+        // A dropped stream resumes strictly after the last received cursor.
+        assert_eq!(log[1], (Some("c2".to_string()), None));
+        // A server-directed reconnect resumes from the cursor it carried.
+        assert_eq!(log[2], (Some("c5".to_string()), None));
+        // The change batch was applied (root's cached listing dropped) and no
+        // probe or poll fan-out ran while the stream was healthy: the startup
+        // probe primed the baseline, cursor reconnects don't re-probe.
+        assert!(!vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE));
+        assert_eq!(
+            hub.list_tree_call_count(),
+            baseline_list_tree,
+            "no fan-out while the stream is healthy"
+        );
+        assert_eq!(
+            hub.probe_revision_call_count(),
+            baseline_probes + 1,
+            "only the startup probe"
+        );
+
+        // Re-load root so the reset's reconcile round has a prefix to list.
+        vfs.readdir(ROOT_INODE).await.unwrap();
+        let lists_before_reset = hub.list_tree_call_count();
+
+        // The server buffer expired while the bucket moved on.
+        hub.set_revision("rev-b");
+        hub.push_follow(FollowEvent::Reset);
+        wait_until(|| hub.follow_connect_log().len() >= 4).await;
+        let log = hub.follow_connect_log();
+        assert!(log.len() >= 4, "expected a re-subscribe after reset, got {log:?}");
+        assert!(
+            hub.list_tree_call_count() > lists_before_reset,
+            "reset must trigger one full re-list"
+        );
+        // The new subscription starts from the fresh updatedAt.
+        assert_eq!(log[3], (None, Some("rev-b".to_string())));
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
+/// A 400 on a resume point (cursor or `since` the server no longer accepts)
+/// doesn't disable live-follow: the client re-lists if the bucket moved and
+/// re-subscribes from scratch, first with `since`, then live. Only a bare
+/// subscribe refused falls back to polling.
+#[test]
+fn follow_resume_point_refused_resubscribes_from_scratch() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    hub.enable_follow();
+    hub.push_follow(FollowEvent::Ready {
+        cursor: Some("c1".to_string()),
+    });
+    hub.end_follow_stream();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
+        wait_until(|| !hub.follow_connect_log().is_empty()).await;
+        // The next two connects (cursor, then since) are refused.
+        hub.fail_next_follow_connect(400);
+        hub.fail_next_follow_connect(400);
+        wait_until(|| hub.follow_connect_log().len() >= 4).await;
+        let log = hub.follow_connect_log();
+        assert!(log.len() >= 4, "expected the resume cascade, got {log:?}");
+        assert_eq!(log[1], (Some("c1".to_string()), None), "cursor resume refused");
+        assert_eq!(log[2], (None, Some("rev-a".to_string())), "since resume refused");
+        assert_eq!(log[3], (None, None), "live subscribe accepted");
+
+        // The live session becomes healthy and the loop is still following:
+        // a later change lands.
+        hub.push_follow(FollowEvent::Ready { cursor: None });
+        hub.push_follow(FollowEvent::Changes {
+            cursor: "c9".to_string(),
+            changes: vec![follow_change("new.txt", FollowOp::Add)],
+        });
+        assert!(
+            wait_until(|| !vfs.inode_table.read().unwrap().is_children_loaded(ROOT_INODE)).await,
+            "changes must still apply after the resume cascade"
+        );
+
+        stop.notify_one();
+        let _ = handle.await;
+    });
+}
+
+/// A Hub without the live-follow endpoint (404) falls back permanently to
+/// the interval poll loop: probes keep firing and a revision change still
+/// triggers the fan-out.
+#[test]
+fn follow_unsupported_falls_back_to_polling() {
+    let hub = MockHub::new();
+    hub.add_file("file.txt", 10, Some("h1"), None);
+    hub.set_revision("rev-a");
+    // follow NOT enabled → follow_events reports 404.
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let baseline_list_tree = hub.list_tree_call_count();
+        let (stop, handle) = spawn_poll_loop(&vfs, &hub, true);
+
+        // The poll loop takes over: probes fire per round (beyond the
+        // startup probe), no fan-out while the revision holds still.
+        assert!(
+            wait_until(|| hub.probe_revision_call_count() >= 5).await,
+            "poll loop must keep probing"
+        );
+        assert_eq!(hub.list_tree_call_count(), baseline_list_tree);
+
+        // A revision change still triggers the fan-out.
+        hub.set_revision("rev-b");
+        assert!(
+            wait_until(|| hub.list_tree_call_count() > baseline_list_tree).await,
+            "fan-out must fire on revision change"
         );
 
         stop.notify_one();

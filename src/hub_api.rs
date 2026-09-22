@@ -6,7 +6,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use xet_client::cas_client::auth::{AuthError, TokenInfo, TokenRefresher};
 
 use crate::error::{Error, Result, is_retryable_status, is_transient_http};
@@ -87,6 +87,26 @@ pub trait HubOps: Send + Sync {
     /// the probe path keep doing full polls.
     async fn probe_revision(&self) -> Result<String> {
         Err(Error::hub("probe_revision not implemented"))
+    }
+
+    /// Open the bucket live-follow SSE stream (`GET /api/buckets/{id}/events`).
+    ///
+    /// `cursor` resumes strictly after a previously received opaque cursor;
+    /// `since` (ISO8601, e.g. the last `updatedAt` seen) replays changes from
+    /// that instant; with neither, only live changes stream (callers pass at
+    /// most one). `Ok(None)` means this source or deployment doesn't serve
+    /// the feed (repo source, 404, non-SSE response): the caller falls back
+    /// to polling permanently. Errors carry the HTTP status (a 400 means the
+    /// request itself was refused, e.g. an unparseable resume point) and, on
+    /// 503/429, the server's wait hint via [`Error::retry_after`]. The
+    /// default impl reports the feed as absent so mocks and non-bucket
+    /// sources use the poll fallback.
+    async fn follow_events(
+        &self,
+        _cursor: Option<&str>,
+        _since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        Ok(None)
     }
 }
 
@@ -261,6 +281,10 @@ pub struct HubApiClient {
     /// Client that does NOT follow redirects — used for HEAD requests where we
     /// need response headers from the Hub (not from the CAS redirect target).
     head_client: Client,
+    /// Client for the live-follow SSE stream: no whole-request timeout (the
+    /// stream is long-lived by design), a per-read timeout instead. The
+    /// server pings every 30s, so 90s of silence means a dead connection.
+    follow_client: Client,
     endpoint: String,
     token: Option<String>,
     /// Path to a file containing the API token. Re-read periodically so
@@ -328,26 +352,30 @@ pub(crate) fn retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(500u64.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1))))
 }
 
-/// Upper bound on any single retry sleep, whether server-hinted (RateLimit
-/// header) or exponential.
+/// Upper bound on a single in-request retry sleep, whether server-hinted
+/// (RateLimit / Retry-After header) or exponential.
 pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Parse the IETF `RateLimit` header for `t=<seconds>` (time until window reset), capped at 30s.
-/// Format: `"resource_type";r=<remaining>;t=<seconds_until_reset>`
-/// This is what moon-landing sends on 429 responses.
+/// A response header as a string, when present and ASCII.
+fn header_str<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Server-requested wait before retrying, uncapped (each retry loop applies
+/// its own ceiling): the IETF `RateLimit` header's `t=<seconds>` (time until
+/// window reset, what moon-landing sends on 429; format
+/// `"resource_type";r=<remaining>;t=<seconds_until_reset>`), else a
+/// `Retry-After: <seconds>` header (what the live-follow endpoint sends on
+/// 503). A zero hint means the window already reset: no hint, use the
+/// backoff schedule rather than retrying immediately.
 fn parse_retry_delay(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
-    let value = headers.get("ratelimit")?.to_str().ok()?;
-    for part in value.split(';') {
-        let part = part.trim();
-        if let Some(secs_str) = part.strip_prefix("t=")
-            && let Ok(secs) = secs_str.parse::<u64>()
-        {
-            // t=0 means the window already reset: no hint, use the backoff
-            // schedule rather than retrying immediately.
-            return (secs > 0).then(|| std::time::Duration::from_secs(secs).min(MAX_RETRY_DELAY));
-        }
-    }
-    None
+    let ratelimit_secs = header_str(headers, "ratelimit").and_then(|value| {
+        value
+            .split(';')
+            .find_map(|part| part.trim().strip_prefix("t=")?.parse::<u64>().ok())
+    });
+    let secs = ratelimit_secs.or_else(|| header_str(headers, "retry-after")?.trim().parse::<u64>().ok())?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Build an authenticated GET request during client initialization (before HubApiClient exists).
@@ -419,7 +447,9 @@ async fn send_with_retry(
                 let status = resp.status().as_u16();
                 let hinted_delay = parse_retry_delay(resp.headers());
                 if is_retryable_status(status) && attempt <= MAX_RETRIES {
-                    let delay = hinted_delay.unwrap_or_else(|| retry_delay(attempt));
+                    let delay = hinted_delay
+                        .unwrap_or_else(|| retry_delay(attempt))
+                        .min(MAX_RETRY_DELAY);
                     warn!("{context}: transient error ({status}), retry {attempt}/{MAX_RETRIES} in {delay:?}");
                     tokio::time::sleep(delay).await;
                     continue;
@@ -441,9 +471,9 @@ async fn send_with_retry(
     }
 }
 
-fn make_clients(backend: &str) -> (Client, Client) {
+fn make_clients(backend: &str) -> (Client, Client, Client) {
     let user_agent = format!("hf-mount/{}; fs/{}", env!("CARGO_PKG_VERSION"), backend);
-    // Idle pool / keep-alive shared across both clients so a hung Hub doesn't
+    // Idle pool / keep-alive shared across the clients so a hung Hub doesn't
     // freeze the poll loop and TLS handshakes are amortized across rounds.
     let base = || {
         reqwest::Client::builder()
@@ -461,7 +491,14 @@ fn make_clients(backend: &str) -> (Client, Client) {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build head_client");
-    (client, head_client)
+    // See HubApiClient::follow_client: a whole-request timeout would cut the
+    // SSE stream mid-session, so bound each body read instead — the server's
+    // 30s pings keep a healthy connection under the 90s ceiling.
+    let follow_client = base()
+        .read_timeout(Duration::from_secs(90))
+        .build()
+        .expect("failed to build follow_client");
+    (client, head_client, follow_client)
 }
 
 impl HubApiClient {
@@ -476,7 +513,7 @@ impl HubApiClient {
         path_prefix: String,
         backend: &str,
     ) -> Result<Arc<Self>> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         let endpoint = endpoint.trim_end_matches('/').to_string();
 
         let (source, last_modified) = match source {
@@ -540,6 +577,7 @@ impl HubApiClient {
         Ok(Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint,
             token: token.map(|t| t.to_string()),
             token_file,
@@ -552,10 +590,11 @@ impl HubApiClient {
 
     /// Create a client for a HuggingFace bucket.
     pub fn new(endpoint: &str, token: Option<&str>, bucket_id: &str, backend: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients(backend);
+        let (client, head_client, follow_client) = make_clients(backend);
         Arc::new(Self {
             client,
             head_client,
+            follow_client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             token_file: None,
@@ -689,6 +728,60 @@ impl HubApiClient {
                 .updated_at
                 .ok_or_else(|| Error::hub("revision probe: bucket response missing updatedAt")),
         }
+    }
+
+    /// Open the bucket live-follow SSE stream. See [`HubOps::follow_events`]
+    /// for the contract; this is the transport: `GET
+    /// /api/buckets/{id}/events` with `Accept: text/event-stream` (mandatory
+    /// — the server 400s without it) and the same bearer auth as tree calls.
+    /// No `send_with_retry`: a 503 here has dedicated semantics (this pod
+    /// doesn't serve the feed or is catching up; its `Retry-After` is
+    /// surfaced through [`Error::retry_after`]) and everything else is
+    /// handled by the caller's reconnect/backoff loop.
+    pub async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        let SourceKind::Bucket { bucket_id } = &self.source else {
+            return Ok(None); // repos have no live-follow feed
+        };
+        let url = format!("{}/api/buckets/{}/events", self.endpoint, bucket_id);
+        let mut req = self
+            .auth(self.follow_client.get(&url))
+            .header("accept", "text/event-stream");
+        if let Some(cursor) = cursor {
+            req = req.query(&[("cursor", cursor)]);
+        } else if let Some(since) = since {
+            req = req.query(&[("since", since)]);
+        }
+        let resp = req.send().await.map_err(Error::Http)?;
+        let status = resp.status().as_u16();
+        if status == 404 {
+            debug!("live-follow: endpoint not served by this Hub (404)");
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let retry_after = parse_retry_delay(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Hub {
+                message: format!("live-follow: {status} {body}"),
+                status: Some(status),
+                retry_after,
+            });
+        }
+        // A 200 that isn't an event stream (a proxy or intermediate Hub
+        // build answering with HTML/JSON) would never yield an event: treat
+        // it as "feed not served" rather than reconnecting forever.
+        let content_type = header_str(resp.headers(), "content-type").unwrap_or_default();
+        if !content_type.starts_with("text/event-stream") {
+            warn!("live-follow: endpoint answered with content-type {content_type:?}, not an event stream");
+            return Ok(None);
+        }
+        Ok(Some(Box::new(crate::follow::HttpFollowStream::new(
+            resp,
+            self.path_prefix.clone(),
+        ))))
     }
 
     /// List tree entries at the given prefix (single directory level).
@@ -1124,6 +1217,13 @@ impl HubOps for HubApiClient {
     async fn probe_revision(&self) -> Result<String> {
         self.probe_revision().await
     }
+    async fn follow_events(
+        &self,
+        cursor: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Option<Box<dyn crate::follow::FollowStreamOps>>> {
+        self.follow_events(cursor, since).await
+    }
 }
 
 /// Fields read from `/api/{type}/{id}` for the cheap-probe path. For repos,
@@ -1363,10 +1463,11 @@ mod tests {
     // ── prefixed_path / strip_path_prefix tests ───────────────────────
 
     fn make_test_client(prefix: &str, token_file: Option<PathBuf>) -> HubApiClient {
-        let (client, head_client) = make_clients("test");
+        let (client, head_client, follow_client) = make_clients("test");
         HubApiClient {
             client,
             head_client,
+            follow_client,
             endpoint: "https://huggingface.co".to_string(),
             token: Some("static-token".to_string()),
             token_file,
@@ -1570,6 +1671,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_delay_falls_back_to_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(7)));
+        // RateLimit wins when both are present.
+        headers.insert("ratelimit", r#""hub_api";r=0;t=3"#.parse().unwrap());
+        assert_eq!(parse_retry_delay(&headers), Some(std::time::Duration::from_secs(3)));
+    }
+
+    #[test]
     fn retry_delay_exponential_backoff() {
         assert_eq!(retry_delay(1), std::time::Duration::from_millis(500));
         assert_eq!(retry_delay(2), std::time::Duration::from_millis(1000));
@@ -1600,7 +1711,8 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("ratelimit", r#""hub_api";r=0;t=45"#.parse().unwrap());
         let duration = parse_retry_delay(&headers).unwrap();
-        assert_eq!(duration, std::time::Duration::from_secs(30)); // capped
+        // Raw hint: each retry loop applies its own ceiling.
+        assert_eq!(duration, std::time::Duration::from_secs(45));
     }
 
     #[test]
