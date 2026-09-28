@@ -43,8 +43,8 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
@@ -69,8 +69,8 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/arm64
@@ -92,23 +92,29 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Create and push manifest
+        env:
+          TAG_BASE: ${{ inputs.tag_base }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
-          BASE="${{ inputs.tag_base }}"
-          TAGS="-t ${{ env.IMAGE }}:${BASE}"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            TAGS="${TAGS} -t ${{ env.IMAGE }}:latest"
+          BASE="${TAG_BASE}"
+          TAGS="-t ${IMAGE}:${BASE}"
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            TAGS="${TAGS} -t ${IMAGE}:latest"
           fi
           docker buildx imagetools create $TAGS \
-            "${{ env.IMAGE }}:${BASE}-amd64" \
-            "${{ env.IMAGE }}:${BASE}-arm64"
+            "${IMAGE}:${BASE}-amd64" \
+            "${IMAGE}:${BASE}-arm64"
 
       - name: Summary
+        env:
+          TAG_BASE: ${{ inputs.tag_base }}
+          PUSH_LATEST: ${{ inputs.push_latest }}
         run: |
           echo "### Docker image pushed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${{ env.IMAGE }}:${{ inputs.tag_base }}\`" >> "$GITHUB_STEP_SUMMARY"
-          if [[ "${{ inputs.push_latest }}" == "true" ]]; then
-            echo "\`${{ env.IMAGE }}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMAGE}:${TAG_BASE}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${PUSH_LATEST}" == "true" ]]; then
+            echo "\`${IMAGE}:latest\`" >> "$GITHUB_STEP_SUMMARY"
           fi
