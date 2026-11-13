@@ -217,10 +217,10 @@ jobs:
 
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- pjdfstest-results -->"
-          
+
           # Sanitize TABLES content by encoding it as JSON string
           TABLES_JSON=$(jq -Rs . <<< "$TABLES")
-          
+
           BODY=$(jq -rn \
             --arg marker "$MARKER" \
             --argjson tables "$TABLES_JSON" \
@@ -295,10 +295,10 @@ jobs:
 
           PR="${{ github.event.pull_request.number }}"
           MARKER="<!-- bench-results -->"
-          
+
           # Sanitize TABLES content by encoding it as JSON string
           TABLES_JSON=$(jq -Rs . <<< "$TABLES")
-          
+
           BODY=$(jq -rn \
             --arg marker "$MARKER" \
             --argjson tables "$TABLES_JSON" \
